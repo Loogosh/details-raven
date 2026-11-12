@@ -1,0 +1,7 @@
+## Interface: 11402
+## Title: |cff80e5ffDetails!|r TinyThreat |cffaaaaaa[Raven feed]|r
+## Notes: CLEU-оценка угрозы + подмена UnitDetailedThreatSituation. Нужен Details_TinyThreat / CinderMeter — сам UI не рисует. Грузится с «!», ДО Details.
+## Author: RavenUI
+## Version: 1.1
+
+RavenThreat.lua
