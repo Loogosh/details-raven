@@ -1,408 +1,440 @@
--- !RavenThreat :: оценка угрозы по журналу боя.
+-- !RavenThreat :: анализатор угрозы по логу боя + обмен по GUID/имени.
 --
--- Зачем. Клиент 1.14.2 отдаёт UnitDetailedThreatSituation, но она всегда возвращает nil:
--- сервер угрозу не передаёт (проверено 9 снимками в бою). Из-за этого блок угрозы не
--- работает ни в Details (Details_TinyThreat), ни в CinderMeter — оба читают эту функцию.
+-- Ключ цели не «голый GUID» (он бывает nil), а строка с типом:
+--   "G:0xF130..." — есть GUID (точное совпадение между клиентами);
+--   "N:Scarlet Defender" — GUID нет, сравниваем по имени.
+-- Так пакет не ломается на клиентах/юнитах без GUID, а при наличии GUID
+-- остаётся точная идентификация цели.
 --
--- Что делаем. Считаем угрозу сами по журналу боя и ПОДМЕНЯЕМ клиентскую функцию своей.
--- Аддон с "!" в имени грузится первым, поэтому метры захватывают в локальные переменные уже
--- нашу версию и начинают показывать числа.
---
--- Модель (как в HunterAggroMeter): угроза от урона считается 1:1, хил по питомцу даёт
--- 0.5 от объёма. Абсолютные значения — это накопленный урон, а проценты считаются
--- относительно лучшего в списке, чтобы полосы метра имели смысл.
---
--- Ограничение, о котором надо помнить: это ОЦЕНКА, а не серверная угроза. У разных
--- способностей разные коэффициенты угрозы, которых мы не видим.
+-- Сервер threat на 1.14.2 не отдаёт (замерено), поэтому считаем по логу боя;
+-- присланное чужим клиентом число приоритетнее локальной оценки.
 
 local ADDON, ns = ...
 
--- DLL file debug disabled in this release build (threat math still runs).
 local SEP = string.char(1)
-local LOG_PATH = 'Logs\\RavenDebug.txt'
-local DLL_FILE_DEBUG = false
+local LOG_PATH = 'Logs\\RavenThreat.log'
+local HEAL_FACTOR = 0.5
+local MAX_TARGETS = 32
+local COMM_PREFIX = 'RT2'
+local COMM_INTERVAL = 1.0
+local TWT_PREFIX = 'TWT'          -- серверный threat Turtle (TWThreat-протокол)
+local TWT_REQUEST = 'TWT_UDTSv4'   -- запрос списка угрозы
+local TWT_INTERVAL = 2.0
 
-local function Log(tag, fmt, ...)
-  if not DLL_FILE_DEBUG then return end
-  local text
-  if select('#', ...) > 0 then
-    local ok, formatted = pcall(string.format, fmt, ...)
-    text = ok and formatted or tostring(fmt)
-  else
-    text = tostring(fmt)
-  end
-  local line = date('%H:%M:%S') .. ' [' .. tostring(tag) .. '] ' .. text .. '\n'
-  local wrapper = _G.RavenEra
-  if type(wrapper) == 'function' then
-    if pcall(wrapper, 'AppendFile', LOG_PATH, line) then return end
-  end
-  local lib = _G.RavenEraLib
-  if lib and lib.Sept then
-    if pcall(lib.Sept, lib, 'AppendFile', LOG_PATH, line) then return end
-  end
-  local raw = _G.RavenEraGate
-  if type(raw) == 'function' then
-    pcall(raw, 'AppendFile', LOG_PATH .. SEP .. line)
-  end
-end
-local BOOT_PATH = 'Logs\\RavenThreatBoot.txt'
--- boot / self-check file probes skipped when DLL_FILE_DEBUG is false
-local THREAT_MELEE = 1.10     -- 110% ближний бой
-local THREAT_RANGED = 1.30    -- 130% дальний бой
-local HEAL_FACTOR = 0.5       -- хил создаёт половину угрозы от объёма
+local myGUID, petGUID
 
-local byTarget = {}           -- [guid цели] = { [guid источника] = накопленная угроза }
-local targetOrder = {}        -- порядок целей, чтобы чистить старые
-local MAX_TARGETS = 8
+-- Плоская угроза способностей (ванильные значения, приблизительно).
+local FLAT_THREAT = {
+	['Sunder Armor'] = 260,
+	['Heroic Strike'] = 145,
+	['Revenge'] = 355,
+	['Shield Slam'] = 250,
+	['Thunder Clap'] = 130,
+	['Demoralizing Shout'] = 43,
+	['Battle Shout'] = 55,
+	['Maul'] = 75,
+	['Swipe'] = 100,
+	['Growl'] = 0,
+}
 
-local myGUID = nil
-local petGUID = nil
-local playerName = nil
-local petName = nil
+local unitByGUID = {}
+local petOwner = {}
 
-local function lowGuid(guid)
-  return guid and string.match(guid, '(%x+)$') or nil
-end
-
-local function forgetOldTargets(keep)
-  local count = 0
-  for guid in pairs(byTarget) do
-    if guid ~= keep then count = count + 1 end
-  end
-  if count < MAX_TARGETS then return end
-  for guid in pairs(byTarget) do
-    if guid ~= keep then byTarget[guid] = nil end
-  end
+local function rebuildUnits()
+	unitByGUID = {}
+	petOwner = {}
+	local function map(unit, pet)
+		local g = UnitGUID(unit)
+		if g then unitByGUID[g] = unit end
+		if pet and g then
+			local p = UnitGUID(pet)
+			if p then petOwner[p] = g; unitByGUID[p] = pet end
+		end
+	end
+	map('player', 'pet')
+	for i = 1, 4 do map('party' .. i, 'partypet' .. i) end
+	for i = 1, 40 do map('raid' .. i, 'raidpet' .. i) end
 end
 
-local function bucket(guid)
-  local entry = byTarget[guid]
-  if not entry then
-    entry = {}
-    byTarget[guid] = entry
-  end
-  return entry
+local function unitFor(key)
+	if type(key) ~= 'string' then return nil end
+	return unitByGUID[key:sub(3)]
 end
 
--- ---------------------------------------------------------------- разбор журнала
+local function multFor(unit)
+	if not unit then return 1 end
+	local function has(spellID)
+		local name = GetSpellInfo and GetSpellInfo(spellID)
+		if not name then return false end
+		for i = 1, 32 do
+			local buff = UnitBuff(unit, i)
+			if not buff then break end
+			if buff == name then return true end
+		end
+		return false
+	end
+	if has(71) or has(5487) or has(9634) then return 1.3 end  -- Defensive / Bear / Dire Bear
+	if has(25780) then return 1.6 end                          -- Righteous Fury
+	if has(768) then return 0.71 end                           -- Cat Form
+	if has(2457) or has(2458) then return 0.8 end            -- Battle / Berserker
+	return 1
+end
+
+local threat = {}   -- [targetKey][sourceKey] = value (локальный лог)
+local remote = {}   -- [targetKey][sourceKey] = value (прислали другие)
+local server = {}   -- [targetKey][sourceKey] = value (ответ сервера TWTv4=)
+local order = {}
+
+local function log(fmt, ...)
+	local ok, text = pcall(string.format, fmt, ...)
+	if not ok then return end
+	local gate = _G.RavenEraGate
+	if type(gate) ~= 'function' then return end
+	pcall(gate, 'AppendFile', LOG_PATH .. SEP .. date('%H:%M:%S') .. ' ' .. text .. '\n')
+end
+
+-- Ключ юнита: GUID, иначе имя. nil — юнит без идентичности (пропускаем).
+local function keyFor(unit)
+	if type(unit) ~= 'string' then return nil end
+	local ok, guid = pcall(UnitGUID, unit)
+	if ok and type(guid) == 'string' and guid ~= '' then
+		return 'G:' .. guid
+	end
+	local okN, name = pcall(UnitName, unit)
+	if okN and type(name) == 'string' and name ~= '' then
+		return 'N:' .. name
+	end
+	return nil
+end
+
+local function clearTarget(targetKey)
+	if not targetKey then return end
+	threat[targetKey] = nil
+	remote[targetKey] = nil
+	server[targetKey] = nil
+	for i = #order, 1, -1 do
+		if order[i] == targetKey then
+			table.remove(order, i)
+		end
+	end
+end
+
+local function bucket(targetKey)
+	local t = threat[targetKey]
+	if not t then
+		t = {}
+		threat[targetKey] = t
+		order[#order + 1] = targetKey
+		if #order > MAX_TARGETS then
+			local old = table.remove(order, 1)
+			threat[old] = nil
+			remote[old] = nil
+			server[old] = nil
+		end
+	end
+	return t
+end
+
+local function add(targetKey, sourceKey, amount)
+	if not targetKey or not sourceKey or not amount or amount <= 0 then return end
+	local t = bucket(targetKey)
+	t[sourceKey] = (t[sourceKey] or 0) + amount
+end
+
+local function ownerKey(sourceKey)
+	if type(sourceKey) == 'string' and sourceKey:sub(1,2) == 'G:' then
+		local owner = petOwner[sourceKey:sub(3)]
+		if owner then return 'G:' .. owner end
+	end
+	if petGUID and myGUID and sourceKey == ('G:' .. petGUID) then
+		return 'G:' .. myGUID
+	end
+	return sourceKey
+end
+
+--------------------------------------------------------------------------------
+-- лог боя
+--------------------------------------------------------------------------------
+
 local function onCombatLog()
-  local info = { CombatLogGetCurrentEventInfo() }
-  local subevent = info[2]
-  if type(subevent) ~= 'string' then return end
+	local info = { CombatLogGetCurrentEventInfo() }
+	local subevent = info[2]
+	if type(subevent) ~= 'string' then return end
 
-  local sourceGUID, destGUID = info[4], info[8]
+	-- Death must clear before the sourceGUID gate: UNIT_DIED often has empty source.
+	-- Stale buckets after respawn made UnitThreatSituation return status 0 → green plates.
+	if subevent == 'UNIT_DIED' or subevent == 'PARTY_KILL' or subevent == 'UNIT_DESTROYED' then
+		local deadGUID = info[8]
+		if type(deadGUID) == 'string' and deadGUID ~= '' then
+			clearTarget('G:' .. deadGUID)
+		end
+		return
+	end
 
-  if subevent:find('_DAMAGE$') or subevent == 'SWING_DAMAGE' then
-    -- У заклинаний сначала три параметра заклинания, у удара — сразу сумма
-    local amount
-    if subevent:find('^SWING_') then
-      amount = info[12]
-    elseif subevent:find('^SPELL_') or subevent:find('^RANGE_') then
-      amount = info[15]
-    elseif subevent:find('^DAMAGE_') then
-      amount = info[12]
-    end
-    amount = tonumber(amount)
-    if not amount or amount <= 0 then return end
-    if not sourceGUID or not destGUID then return end
+	local sourceGUID, destGUID = info[4], info[8]
+	if type(sourceGUID) ~= 'string' or type(destGUID) ~= 'string' then return end
 
-    local entry = bucket(destGUID)
-    entry[sourceGUID] = (entry[sourceGUID] or 0) + amount
-    forgetOldTargets(destGUID)
-    return
-  end
+	local targetKey = 'G:' .. destGUID
+	local sourceKey = ownerKey('G:' .. sourceGUID)
 
-  -- Хил по питомцу добавляем игроку: половина объёма
-  if subevent == 'SPELL_HEAL' then
-    if petGUID and destGUID == petGUID and myGUID then
-      local amount = tonumber(info[15])
-      if amount and amount > 0 then
-        local target = UnitGUID('target')
-        if target then
-          local entry = bucket(target)
-          entry[myGUID] = (entry[myGUID] or 0) + amount * HEAL_FACTOR
-        end
-      end
-    end
-  end
+	if subevent == 'SWING_DAMAGE' then
+		local amount = tonumber(info[12])
+		if amount and amount > 0 then add(targetKey, sourceKey, amount * multFor(unitFor(sourceKey))) end
+		return
+	end
+
+	if subevent == 'SPELL_DAMAGE' or subevent == 'SPELL_PERIODIC_DAMAGE'
+		or subevent == 'RANGE_DAMAGE' or subevent == 'DAMAGE_SHIELD'
+		or subevent == 'DAMAGE_SPLIT' then
+		local amount = tonumber(info[15])
+		if amount and amount > 0 then add(targetKey, sourceKey, amount * multFor(unitFor(sourceKey))) end
+		return
+	end
+
+	if subevent == 'SPELL_CAST_SUCCESS' then
+		local spellId = tonumber(info[12])
+		local name = spellId and GetSpellInfo and GetSpellInfo(spellId)
+		local flat = name and FLAT_THREAT[name]
+		if flat and flat > 0 then
+			local dest = info[8]
+			local targetKey
+			if dest and dest ~= '0000000000000000' then
+				targetKey = 'G:' .. dest
+			else
+				targetKey = keyFor('target')
+			end
+			if targetKey then add(targetKey, ownerKey('G:' .. sourceGUID), flat) end
+		end
+		return
+	end
+
+	if subevent == 'SPELL_HEAL' or subevent == 'SPELL_PERIODIC_HEAL' then
+		local amount = tonumber(info[15])
+		if amount and amount > 0 and destGUID ~= sourceGUID then
+			local tKey = keyFor('target')
+			if tKey then add(tKey, sourceKey, amount * HEAL_FACTOR) end
+		end
+	end
 end
 
--- ---------------------------------------------------------------- оценка
-local function estimate(sourceGUID, targetGUID)
-  local entry = byTarget[targetGUID]
-  if not entry then return nil end
+--------------------------------------------------------------------------------
+-- обмен: ключ в пакете — G:guid или N:name
+--------------------------------------------------------------------------------
 
-  local value = entry[sourceGUID]
-  if not value then
-    -- источник ещё ничего не сделал, но данные по цели есть
-    value = 0
-  end
+local nameToKey = {}
 
-  local best = 0
-  for _, other in pairs(entry) do
-    if other > best then best = other end
-  end
-  if best <= 0 then return nil end
+local function keyForName(name)
+	if not name or name == '' then return nil end
+	if name == UnitName('player') then return keyFor('player') end
+	if nameToKey[name] then return nameToKey[name] end
 
-  local scaled = (value / best) * 100
-  local status
-  if value <= 0 then
-    status = 0
-  elseif value >= best then
-    status = 3
-  elseif scaled >= 90 then
-    status = 2
-  elseif scaled >= 50 then
-    status = 1
-  else
-    status = 0
-  end
+	local units = { 'player' }
+	for i = 1, 4 do units[#units + 1] = 'party' .. i end
+	for i = 1, 40 do units[#units + 1] = 'raid' .. i end
 
-  -- Первое возвращаемое — "данные есть", а не "танкует". Раньше здесь стояло условие
-  -- scaled >= 100, из-за чего шим отдавал nil всем, кроме лидера по угрозе, и метры
-  -- показывали только одну строку.
-  return true, (scaled >= 100), status, scaled, scaled, value
+	for _, unit in ipairs(units) do
+		if UnitName(unit) == name then
+			local key = keyFor(unit)
+			if key then nameToKey[name] = key end
+			return key
+		end
+	end
+	return nil
 end
 
--- ---------------------------------------------------------------- подмена API
-local originalDetailed = UnitDetailedThreatSituation
-local originalSimple = UnitThreatSituation
+local function broadcast()
+	local targetKey = keyFor('target')
+	if not targetKey then return end
+	local selfKey = keyFor('player')
+	if not selfKey then return end
+
+	local value = threat[targetKey] and threat[targetKey][selfKey] or 0
+	if value <= 0 then return end
+
+	local channel = IsInRaid() and 'RAID' or (IsInGroup() and 'PARTY' or nil)
+	if not channel then return end
+
+	-- В пакете оба ключа: получатель с GUID возьмёт G:, без GUID — N:.
+	local payload = targetKey
+	local name = UnitName('target')
+	if type(name) == 'string' and name ~= '' then
+		payload = payload .. '~N:' .. name
+	end
+	SendAddonMessage(COMM_PREFIX, payload .. '|' .. string.format('%d', math.floor(value)), channel)
+end
+
+local function onAddonMessage(prefix, msg, _, sender)
+	if type(msg) ~= 'string' then return end
+
+	-- Ответ сервера в формате TWThreat: TWTv4=Name:1:12345:45:1;...
+	if prefix == TWT_PREFIX then
+		local data = msg:match('TWTv4=(.*)$')
+		if not data then return end
+		local targetKey = keyFor('target')
+		if not targetKey then return end
+		local t = server[targetKey]
+		if not t then t = {}; server[targetKey] = t end
+		for entry in data:gmatch('[^;]+') do
+			local name, threatValue = entry:match('^([^:]+):[^:]*:([%-%d]+)')
+			local value = tonumber(threatValue)
+			if name and value then
+				local sKey = keyForName(name)
+				if sKey then t[sKey] = value end
+			end
+		end
+		return
+	end
+
+	if prefix ~= COMM_PREFIX then return end
+	local keys, value = msg:match('^(.-)|(%d+)$')
+	value = tonumber(value)
+	if not keys or not value then return end
+
+	local sourceKey = keyForName(sender)
+	if not sourceKey then return end
+
+	for part in keys:gmatch('[^~]+') do
+		local key = part
+		-- совместимость: старый формат «голый GUID»
+		if key:sub(1, 2) ~= 'G:' and key:sub(1, 2) ~= 'N:' then
+			key = 'G:' .. key
+		end
+		local t = remote[key]
+		if not t then t = {}; remote[key] = t end
+		t[sourceKey] = value
+	end
+end
+
+--------------------------------------------------------------------------------
+-- наружу
+--------------------------------------------------------------------------------
+
+local function valueFor(targetKey, sourceKey)
+	local remoteValue = remote[targetKey] and remote[targetKey][sourceKey]
+	if remoteValue then return remoteValue end
+	return threat[targetKey] and threat[targetKey][sourceKey] or 0
+end
+
+local function bestFor(targetKey)
+	local best = 0
+	-- нельзя ipairs({a,b,c}): при a=nil таблица начинается с индекса 2,
+	-- ipairs останавливается сразу и best остаётся 0.
+	local function scan(tbl)
+		if not tbl then return end
+		for _, v in pairs(tbl) do
+			if v > best then best = v end
+		end
+	end
+	scan(server[targetKey])
+	scan(threat[targetKey])
+	scan(remote[targetKey])
+	return best
+end
+
+local function estimate(sourceUnit, targetUnit)
+	local tKey = keyFor(targetUnit)
+	local sKey = keyFor(sourceUnit)
+	if not tKey or not sKey then return nil end
+	if not threat[tKey] and not remote[tKey] then return nil end
+
+	local value = valueFor(tKey, sKey)
+	local best = bestFor(tKey)
+	if best <= 0 then return nil end
+
+	local pct = (value / best) * 100
+	local status
+	if value <= 0 then
+		status = 0
+	elseif pct >= 100 then
+		status = 3
+	elseif pct >= 90 then
+		status = 2
+	elseif pct >= 50 then
+		status = 1
+	else
+		status = 0
+	end
+	return true, (pct >= 100), status, pct, pct, value
+end
 
 local function shimDetailed(source, target)
-  -- Оригинал на этом клиенте всегда возвращает nil, а при неверных аргументах ещё и
-  -- выдаёт 'Usage: UnitDetailedThreatSituation("unit" [, "mob"])'. Поэтому его не зовём
-  -- вовсе: наши данные либо есть, либо функция возвращает nil.
-  if type(source) ~= 'string' or type(target) ~= 'string' then return nil end
-
-  local targetGUID = UnitGUID(target)
-  local sourceGUID = UnitGUID(source)
-  if not targetGUID or not sourceGUID then return nil end
-
-  local hasData, isTanking, status, scaled, raw, value = estimate(sourceGUID, targetGUID)
-  if not hasData then return nil end
-
-  return isTanking, status, scaled, raw, value
+	if type(source) ~= 'string' or type(target) ~= 'string' then return nil end
+	if UnitIsDead(target) then return nil end
+	local hasData, isTanking, status, pct, raw, value = estimate(source, target)
+	if not hasData then return nil end
+	return isTanking, status, pct, raw, value
 end
 
 local function shimSimple(source, target)
-  local ok, status = shimDetailed(source, target)
-  if not ok then return nil end
-  return status
+	if type(source) ~= 'string' or type(target) ~= 'string' then return nil end
+	local hasData, _, status = estimate(source, target)
+	if not hasData then return nil end
+	return status
 end
 
-UnitDetailedThreatSituation = shimDetailed
-UnitThreatSituation = shimSimple
+-- В этом клиенте окружение аддона может быть песочницей: пишем явно в _G.
+_G.__ravenThreatShim = shimDetailed
+_G.UnitDetailedThreatSituation = shimDetailed
+_G.UnitThreatSituation = shimSimple
 
--- ---------------------------------------------------------------- события
+--------------------------------------------------------------------------------
+-- события
+--------------------------------------------------------------------------------
+
 local frame = CreateFrame('Frame')
 frame:RegisterEvent('PLAYER_LOGIN')
 frame:RegisterEvent('PLAYER_ENTERING_WORLD')
 frame:RegisterEvent('PLAYER_TARGET_CHANGED')
-frame:RegisterEvent('PLAYER_REGEN_ENABLED')
+frame:RegisterEvent('CHAT_MSG_ADDON')
 pcall(frame.RegisterEvent, frame, 'COMBAT_LOG_EVENT_UNFILTERED')
 
-frame:SetScript('OnEvent', function(self, event)
-  if event == 'COMBAT_LOG_EVENT_UNFILTERED' then
-    onCombatLog()
-    return
-  end
-
-  if event == 'PLAYER_LOGIN' or event == 'PLAYER_ENTERING_WORLD' then
-    myGUID = UnitGUID('player')
-    petGUID = UnitGUID('pet')
-    playerName = UnitName('player')
-    petName = UnitName('pet')
-    Log('threat', 'оценка угрозы активна: игрок %s, пет %s', tostring(playerName), tostring(petName))
-    return
-  end
-
-  if event == 'PLAYER_TARGET_CHANGED' then
-    petGUID = UnitGUID('pet')
-    petName = UnitName('pet')
-    return
-  end
-
-  if event == 'PLAYER_REGEN_ENABLED' then
-    -- бой кончился: оставляем данные, они нужны метрам для итоговой строки,
-    -- но чистим по смене цели, чтобы не копилось
-    return
-  end
+frame:SetScript('OnEvent', function(self, event, ...)
+	if event == 'COMBAT_LOG_EVENT_UNFILTERED' then
+		onCombatLog()
+		return
+	end
+	if event == 'CHAT_MSG_ADDON' then
+		onAddonMessage(...)
+		return
+	end
+	if event == 'PLAYER_LOGIN' or event == 'PLAYER_ENTERING_WORLD' or event == 'GROUP_ROSTER_UPDATE' or event == 'PARTY_MEMBERS_CHANGED' then
+		myGUID = UnitGUID('player')
+		petGUID = UnitGUID('pet')
+		rebuildUnits()
+	end
 end)
 
--- Наружу — для собственных модулей и диагностики
+frame:SetScript('OnUpdate', (function()
+	local acc, twtAcc = 0, 0
+	return function(_, elapsed)
+		acc = acc + elapsed
+		twtAcc = twtAcc + elapsed
+		if acc >= COMM_INTERVAL then
+			acc = 0
+			broadcast()
+		end
+		if twtAcc >= TWT_INTERVAL then
+			twtAcc = 0
+			local channel = IsInRaid() and 'RAID' or (IsInGroup() and 'PARTY' or nil)
+			if channel then pcall(SendAddonMessage, TWT_REQUEST, 'limit=20', channel) end
+		end
+	end
+end)())
+
 _G.RavenThreatAPI = {
-  version = 1,
-  Get = function(source, target)
-    return shimDetailed(source, target)
-  end,
-  Thresholds = { melee = THREAT_MELEE, ranged = THREAT_RANGED, heal = HEAL_FACTOR },
+	threat = threat,
+	remote = remote,
+	keyFor = keyFor,
+	version = 8,
 }
 
--- ---------------------------------------------------------------- порт TWThreat 1.3.0
--- Один в один как в оригинале, только без окна: всё уходит в лог.
---
--- Исходящие (номера строк TWThreat.lua):
---   :2521-2524  TWTVersion:<версия>  -> PARTY, GUILD, RAID, BATTLEGROUND при входе в мир
---   :334        TWT_ME:<версия>      -> ответ на TWT_WHO
---   :1207-1208  TWT_UDTSv4 'limit=4' -> запрос угрозы, канал RAID или PARTY
---   :1203-1204  TWT.send(msg)        -> SendAddonMessage('TWT', msg, канал)
---
--- Входящие на префиксе TWT:
---   :319  TWTVersion:<в>  — версия у другого игрока
---   :333  TWT_WHO         — отвечаем TWT_ME
---   :338  TWTRoleTexture: — иконка роли игрока
---   :344  TWT_ME:<в>      — у игрока есть аддон
---
--- Угроза приходит телом с 'TWTv4=', записи через ';', поля через ':'
--- (имя:танк:угроза:процент:ближний). Танк-режим — блок после '#' с меткой 'TMTv1='.
-local ADDON_VERSION = '1.3.0'
-local BARS = 5                        -- TWT.minBars по умолчанию
-local LIMIT = BARS - 1                -- в запрос уходит limit=4
-local PREFIX = 'TWT'                  -- TWT.prefix
-local UDTS = 'TWT_UDTSv4'             -- TWT.UDTS
-local UDTS_TM = 'TWT_UDTSv4_TM'       -- TWT.UDTS .. '_TM'
-local THREAT_API = 'TWTv4='           -- TWT.threatApi
-local TANK_API = 'TMTv1='             -- TWT.tankModeApi
+log('RavenThreat v8: clear on UNIT_DIED; dead target → nil')
 
-local PREFIXES = { PREFIX, UDTS, UDTS_TM, 'TWTv4', 'TMTv1' }
-if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
-  for i = 1, #PREFIXES do
-    pcall(C_ChatInfo.RegisterAddonMessagePrefix, PREFIXES[i])
-  end
-end
 
--- TWT.channel: RAID если в рейде, иначе PARTY (:1132)
-local function channel()
-  if IsInRaid and IsInRaid() then return 'RAID' end
-  return 'PARTY'
-end
 
--- TWT.send (:1203)
-local function send(message)
-  if not (C_ChatInfo and C_ChatInfo.SendAddonMessage) then return false end
-  local ok, sent = pcall(C_ChatInfo.SendAddonMessage, PREFIX, message, channel())
-  return ok and sent
-end
 
--- TWT.sendMyVersion (:2520)
-local function sendMyVersion()
-  if not (C_ChatInfo and C_ChatInfo.SendAddonMessage) then return end
-  local channels = { 'PARTY', 'GUILD', 'RAID', 'BATTLEGROUND' }
-  for i = 1, #channels do
-    pcall(C_ChatInfo.SendAddonMessage, PREFIX, 'TWTVersion:' .. ADDON_VERSION, channels[i])
-  end
-end
 
-local lastRequestSignature
--- TWT.UnitDetailedThreatSituation (:1207)
-local function requestThreat()
-  if not (C_ChatInfo and C_ChatInfo.SendAddonMessage) then return end
-  local ch = channel()
-  local ok, sent = pcall(C_ChatInfo.SendAddonMessage, UDTS, 'limit=' .. LIMIT, ch)
-  local signature = ch .. tostring(sent)
-  if signature ~= lastRequestSignature then
-    lastRequestSignature = signature
-    Log('threat', 'запрос угрозы: limit=%d канал=%s ok=%s отправлено=%s',
-      LIMIT, ch, tostring(ok), tostring(sent))
-  end
-end
 
--- TWT.handleTankModePacket: блок после '#'
-local function handleTankMode(packet)
-  Log('threat', 'танк-режим: %s', tostring(packet))
-end
 
--- TWT.handleThreatPacket (:790)
-local function handleThreatPacket(text)
-  local data, tankPart = text, nil
-  if string.find(data, '#', 1, true) and string.find(data, TANK_API, 1, true) then
-    local first, second = string.match(data, '^(.-)#(.*)$')
-    if first then data, tankPart = first, second end
-  end
 
-  local body = string.match(data, 'TWTv4=(.*)')
-  if not body then return end
-  if tankPart then handleTankMode(tankPart) end
 
-  local rows, count = {}, 0
-  for entry in string.gmatch(body, '[^;]+') do
-    local name, tank, threat, pct, melee = string.match(entry, '^([^:]+):(%d+):(%-?%d+):(%-?%d+):(%d+)')
-    if name then
-      count = count + 1
-      if count <= BARS then
-        rows[#rows + 1] = string.format('%s: угроза=%s %s%% танк=%s ближний=%s',
-          name, threat, pct, tank, melee)
-      end
-    end
-  end
-
-  Log('threat', 'пакет угрозы: записей %d', count)
-  for i = 1, #rows do Log('threat', '  %s', rows[i]) end
-
-  ns.lastThreat = { at = GetTime(), count = count, rows = rows }
-end
-
--- Общий приём аддон-сообщений (:298 и :318)
-local watch = CreateFrame('Frame')
-pcall(watch.RegisterEvent, watch, 'CHAT_MSG_ADDON')
-watch:SetScript('OnEvent', function(_, event, prefix, text, channelType, sender)
-  if type(text) ~= 'string' then return end
-
-  -- пакеты угрозы проверяем по телу, как оригинал (:298)
-  if string.find(text, THREAT_API, 1, true) then
-    handleThreatPacket(text)
-    return
-  end
-
-  -- служебные сообщения на нашем префиксе (:318)
-  if prefix ~= PREFIX then return end
-
-  if string.sub(text, 1, 11) == 'TWTVersion:' then
-    Log('threat', 'версия у %s: %s', tostring(sender), tostring(string.sub(text, 12)))
-    return
-  end
-
-  if string.sub(text, 1, 7) == 'TWT_WHO' then
-    send('TWT_ME:' .. ADDON_VERSION)
-    Log('threat', 'ответил на TWT_WHO от %s', tostring(sender))
-    return
-  end
-
-  if string.sub(text, 1, 15) == 'TWTRoleTexture:' then
-    ns.roles = ns.roles or {}
-    ns.roles[sender] = string.sub(text, 16)
-    Log('threat', 'роль %s: %s', tostring(sender), tostring(ns.roles[sender]))
-    return
-  end
-
-  if string.sub(text, 1, 7) == 'TWT_ME:' then
-    ns.hasAddon = ns.hasAddon or {}
-    ns.hasAddon[sender] = string.sub(text, 8)
-    Log('threat', 'аддон есть у %s: %s', tostring(sender), tostring(ns.hasAddon[sender]))
-    return
-  end
-end)
-
--- Тик запросов. В оригинале updateUI зовётся по событиям UNIT_THREAT_*, которых на 1.14
--- нет, поэтому тик на OnUpdate: в бою раз в секунду, вне боя раз в пять.
-local tick = CreateFrame('Frame')
-local elapsed = 0
-tick:SetScript('OnUpdate', function(_, delta)
-  elapsed = elapsed + delta
-  local interval = UnitAffectingCombat('player') and 1 or 5
-  if elapsed < interval then return end
-  elapsed = 0
-  requestThreat()
-end)
-
-local login = CreateFrame('Frame')
-pcall(login.RegisterEvent, login, 'PLAYER_ENTERING_WORLD')
-pcall(login.RegisterEvent, login, 'GROUP_ROSTER_UPDATE')
-login:SetScript('OnEvent', function(_, event)
-  lastRequestSignature = nil
-  if event == 'PLAYER_ENTERING_WORLD' then
-    sendMyVersion()
-    Log('threat', 'объявил версию %s (PARTY/GUILD/RAID/BATTLEGROUND)', ADDON_VERSION)
-  end
-  requestThreat()
-end)
